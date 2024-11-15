@@ -22,7 +22,7 @@
   "homepage": "https://github.com/hasura/graphql-engine/tree/master/community/boilerplates/auth-webhooks/passport-js#readme",
   "dependencies": {
     "bcrypt": "^3.0.0",
-    "body-parser": "^1.18.3",
+    "body-parser": "^2.0.1",
     "chalk": "^2.4.1",
     "crypto": "^1.0.1",
     "dotenv": "^6.0.0",
