@@ -9,6 +9,6 @@
     "@apollo/gateway": "2.9.3",
     "graphql": "16.8.1",
     "graphql-tag": "2.10.1",
-    "@apollo/subgraph": "2.0.4"
+    "@apollo/subgraph": "2.9.3"
   }
 }
