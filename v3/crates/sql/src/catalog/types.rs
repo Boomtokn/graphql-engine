@@ -1,11 +1,13 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet},
     fmt::{Debug, Display},
     sync::Arc,
 };
 
 use indexmap::IndexMap;
-use metadata_resolve::{self as resolved, Qualified};
+use metadata_resolve::{
+    self as resolved, Qualified, QualifiedTypeReference, ScalarTypeRepresentation,
+};
 use open_dds::{identifier::SubgraphName, types::CustomTypeName};
 
 mod datafusion {
@@ -20,11 +22,90 @@ mod open_dd {
 
 use datafusion::DataType;
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
+
+type SupportedScalar = (NormalizedType, datafusion::DataType);
+
+#[derive(Error, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum UnsupportedScalar {
+    #[error("Multiple NDC type representations found for scalar type '{0}'")]
+    MultipleNdcTypeRepresentations(CustomTypeName, BTreeSet<ndc_models::TypeRepresentation>),
+    #[error("No NDC representation found for scalar type '{0}'")]
+    NoNdcRepresentation(CustomTypeName),
+    #[error("Unsupported NDC type representation for scalar type '{0}': {1:?}")]
+    NdcRepresentationNotSupported(CustomTypeName, ndc_models::TypeRepresentation),
+}
+
+type Scalar = Result<SupportedScalar, UnsupportedScalar>;
+
+pub fn resolve_scalar_type(
+    scalar_type_name: &Qualified<CustomTypeName>,
+    representation: &ScalarTypeRepresentation,
+) -> Scalar {
+    let representations: BTreeSet<ndc_models::TypeRepresentation> =
+        representation.representations.values().cloned().collect();
+    let mut iter = representations.into_iter();
+    let ndc_representation = match iter.next() {
+        Some(type_representation) => {
+            // more than one representation
+            if iter.next().is_some() {
+                return Err(UnsupportedScalar::MultipleNdcTypeRepresentations(
+                    scalar_type_name.name.clone(),
+                    representation.representations.values().cloned().collect(),
+                ));
+            }
+            // since NDC 0.2.0 we can no longer differentiate between a JSON TypeRepresentation
+            // that is explicitly provided by a user, and one that is provided as a default when
+            // upgrading a `0.1.x` connector. Therefore if we see JSON we always try and match the
+            // name first, falling back to JSON.
+            // When NDC 0.1.0 is no longer in active use we should revisit this behaviour and
+            // instead trust the connector for more predictable results
+            Some(match type_representation {
+                ndc_models::TypeRepresentation::JSON => {
+                    infer_ndc_representation(&scalar_type_name.name).unwrap_or(type_representation)
+                }
+                _ => type_representation,
+            })
+        }
+        // if no representation, let's try and infer it from name
+        None => infer_ndc_representation(&scalar_type_name.name),
+    };
+
+    let ndc_representation = ndc_representation
+        .ok_or_else(|| UnsupportedScalar::NoNdcRepresentation(scalar_type_name.name.clone()))?;
+    ndc_representation_to_datatype(&ndc_representation).ok_or_else(|| {
+        UnsupportedScalar::NdcRepresentationNotSupported(
+            scalar_type_name.name.clone(),
+            ndc_representation.clone(),
+        )
+    })
+}
+
+pub fn resolve_scalar_types(
+    metadata: &resolved::Metadata,
+) -> BTreeMap<Qualified<CustomTypeName>, Scalar> {
+    let mut custom_scalars: BTreeMap<Qualified<CustomTypeName>, Scalar> = BTreeMap::new();
+    for (scalar_type_name, representation) in &metadata.scalar_types {
+        let scalar = resolve_scalar_type(scalar_type_name, representation);
+        custom_scalars.insert(scalar_type_name.clone(), scalar);
+    }
+    custom_scalars
+}
 
 pub struct TypeRegistry {
-    custom_scalars: HashMap<Qualified<CustomTypeName>, ndc_models::TypeRepresentation>,
-    struct_types: HashMap<Qualified<CustomTypeName>, StructType>,
+    custom_scalars: BTreeMap<Qualified<CustomTypeName>, Scalar>,
+    struct_types: BTreeMap<Qualified<CustomTypeName>, Struct>,
     default_schema: Option<SubgraphName>,
+}
+
+#[derive(Error, Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub enum UnsupportedType {
+    #[error("Unsupported scalar type: {0}")]
+    Scalar(#[from] UnsupportedScalar),
+    #[error("Unsupported object type: {0}")]
+    Object(#[from] UnsupportedObject),
+    #[error("type not found in internal registry")]
+    InternalNotFound,
 }
 
 impl TypeRegistry {
@@ -32,7 +113,7 @@ impl TypeRegistry {
         // build a default schema by checking if the object types are spread across more than one
         // subgraph
         let default_schema = {
-            let subgraphs: HashSet<_> = metadata
+            let subgraphs: BTreeSet<_> = metadata
                 .object_types
                 .keys()
                 .map(|object_type_name| &object_type_name.subgraph)
@@ -44,95 +125,21 @@ impl TypeRegistry {
             }
         };
 
-        // Find a representation for custom scalars at opendd
-        let mut custom_scalar_representations: HashMap<
-            &Qualified<CustomTypeName>,
-            HashSet<ndc_models::TypeRepresentation>,
-        > = HashMap::new();
+        let custom_scalars = resolve_scalar_types(metadata);
 
-        for resolved_object in metadata.object_types.values() {
-            let object_type_fields = &resolved_object.object_type.fields;
-            for (field_name, scalar_representations) in
-                resolved_object.type_mappings.scalar_representations()
-            {
-                use metadata_resolve::{QualifiedBaseType, QualifiedTypeName};
-                let representations = object_type_fields.get(field_name).and_then(|field| {
-                    match &field.field_type.underlying_type {
-                        QualifiedBaseType::Named(named) => match named {
-                            QualifiedTypeName::Inbuilt(_) => None,
-                            QualifiedTypeName::Custom(custom_type_name) => {
-                                Some((custom_type_name, scalar_representations))
-                            }
-                        },
-                        QualifiedBaseType::List(_) => None,
-                    }
-                });
-                if let Some((scalar_type_name, representations)) = representations {
-                    custom_scalar_representations
-                        .entry(scalar_type_name)
-                        .or_default()
-                        .extend(representations.clone());
-                }
-            }
+        let mut struct_types: BTreeMap<Qualified<CustomTypeName>, Struct> = BTreeMap::new();
+
+        for (object_type_name, object_type) in &metadata.object_types {
+            let struct_type = struct_type(
+                default_schema.as_ref(),
+                metadata,
+                &custom_scalars,
+                object_type_name,
+                object_type,
+                &BTreeSet::from_iter([object_type_name.clone()]),
+            );
+            struct_types.insert(object_type_name.clone(), struct_type);
         }
-
-        let mut custom_scalars: HashMap<Qualified<CustomTypeName>, ndc_models::TypeRepresentation> =
-            custom_scalar_representations
-                .into_iter()
-                .filter_map(|(custom_scalar_typename, representations)| {
-                    if representations.len() == 1 {
-                        representations
-                            .into_iter()
-                            .next()
-                            .map(|representation| (custom_scalar_typename.clone(), representation))
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-
-        // if no representation could be found, determine it by their name
-        for scalar_type_name in metadata.scalar_types.keys() {
-            let ndc_representation = match scalar_type_name.name.to_string().to_lowercase().as_str() {
-                "bool" => Some(ndc_models::TypeRepresentation::Boolean),
-                "int8" => Some(ndc_models::TypeRepresentation::Int8),
-                "int16" => Some(ndc_models::TypeRepresentation::Int16),
-                "int32" => Some(ndc_models::TypeRepresentation::Int32),
-                "int64" => Some(ndc_models::TypeRepresentation::Int64),
-                "float32" => Some(ndc_models::TypeRepresentation::Float32),
-                "float64" |
-                // BigDecimal128 is not supported by arrow.
-                "bigdecimal" => Some(ndc_models::TypeRepresentation::Float64),
-                "varchar" |
-                "text" => Some(ndc_models::TypeRepresentation::String),
-                "timestamp"
-                |
-                "timestamptz" => Some(ndc_models::TypeRepresentation::Timestamp),
-                _ => None,
-            };
-            if !custom_scalars.contains_key(scalar_type_name) {
-                if let Some(ndc_representation) = ndc_representation {
-                    custom_scalars.insert(scalar_type_name.clone(), ndc_representation);
-                }
-            }
-        }
-
-        let struct_types = metadata
-            .object_types
-            .iter()
-            .map(|(object_type_name, object_type)| {
-                (
-                    object_type_name.clone(),
-                    struct_type(
-                        &default_schema,
-                        metadata,
-                        &custom_scalars,
-                        object_type_name,
-                        object_type,
-                    ),
-                )
-            })
-            .collect();
 
         Self {
             custom_scalars,
@@ -144,26 +151,27 @@ impl TypeRegistry {
     pub(crate) fn get_datafusion_type(
         &self,
         base_type: &resolved::QualifiedBaseType,
-    ) -> Option<(NormalizedType, datafusion::DataType)> {
+    ) -> Result<(NormalizedType, datafusion::DataType), UnsupportedType> {
         use resolved::{QualifiedBaseType, QualifiedTypeName};
         match base_type {
             QualifiedBaseType::Named(QualifiedTypeName::Inbuilt(inbuilt_type)) => {
-                Some(built_in_type(inbuilt_type))
+                Ok(built_in_type(inbuilt_type))
             }
             QualifiedBaseType::Named(QualifiedTypeName::Custom(custom_type_name)) => {
-                if let Some(ndc_representation) = self.custom_scalars.get(custom_type_name) {
-                    ndc_representation_to_datatype(ndc_representation)
-                } else if let Some(struct_type) = self.struct_types.get(custom_type_name) {
+                if let Some(scalar_result) = self.custom_scalars.get(custom_type_name) {
+                    Ok(scalar_result.clone()?)
+                } else if let Some(struct_result) = self.struct_types.get(custom_type_name) {
+                    let struct_type = struct_result.as_ref().map_err(std::clone::Clone::clone)?;
                     let datafusion_type =
                         datafusion::DataType::Struct(struct_type.table_schema().fields.clone());
-                    Some((
+                    Ok((
                         NormalizedType::Named(NormalizedTypeNamed::Struct(
                             struct_type.name().clone(),
                         )),
                         datafusion_type,
                     ))
                 } else {
-                    None
+                    Err(UnsupportedType::InternalNotFound)
                 }
             }
             QualifiedBaseType::List(element_type) => {
@@ -174,7 +182,7 @@ impl TypeRegistry {
                     data_type,
                     element_type.nullable,
                 )));
-                Some((
+                Ok((
                     NormalizedType::List(Box::new(NormalizedTypeReference {
                         underlying_type: normalized_type,
                         nullable: element_type.nullable,
@@ -188,16 +196,26 @@ impl TypeRegistry {
     pub(crate) fn get_object(
         &self,
         type_name: &resolved::Qualified<CustomTypeName>,
-    ) -> Option<&StructType> {
+    ) -> Option<&Struct> {
         self.struct_types.get(type_name)
+        // ) -> Result<&StructType, UnsupportedObject> {
+        // match self.struct_types.get(type_name) {
+        //     None => Err(UnsupportedObject::InternalNotFound),
+        //     Some(Ok(r#struct)) => Ok(r#struct),
+        //     Some(Err(unsupported)) => Err(unsupported.clone()),
+        // }
     }
 
-    pub(crate) fn struct_types(&self) -> &HashMap<Qualified<CustomTypeName>, StructType> {
+    pub(crate) fn struct_types(&self) -> &BTreeMap<Qualified<CustomTypeName>, Struct> {
         &self.struct_types
     }
 
     pub(crate) fn default_schema(&self) -> Option<&SubgraphName> {
         self.default_schema.as_ref()
+    }
+
+    pub fn custom_scalars(&self) -> &BTreeMap<Qualified<CustomTypeName>, Scalar> {
+        &self.custom_scalars
     }
 }
 
@@ -255,10 +273,10 @@ pub struct StructTypeName(pub String);
 
 impl StructTypeName {
     fn new(
-        default_schema: &Option<SubgraphName>,
+        default_schema: Option<&SubgraphName>,
         object_type_name: &Qualified<CustomTypeName>,
     ) -> Self {
-        let name = if Some(&object_type_name.subgraph) == default_schema.as_ref() {
+        let name = if Some(&object_type_name.subgraph) == default_schema {
             object_type_name.name.to_string()
         } else {
             format!("{}_{}", object_type_name.subgraph, object_type_name.name)
@@ -267,10 +285,18 @@ impl StructTypeName {
     }
 }
 
+#[derive(Clone)]
+pub struct UnsupportedField {
+    pub field_type: QualifiedTypeReference,
+    pub reason: UnsupportedType,
+}
+
+#[derive(Clone)]
 pub(crate) struct StructType {
     pub name: StructTypeName,
     pub description: Option<String>,
     pub fields: IndexMap<open_dd::FieldName, StructTypeField>,
+    pub unsupported_fields: IndexMap<open_dd::FieldName, UnsupportedField>,
     pub schema: datafusion::SchemaRef,
 }
 
@@ -292,6 +318,7 @@ impl StructType {
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct StructTypeField {
     pub _name: open_dd::FieldName,
     pub description: Option<String>,
@@ -300,15 +327,25 @@ pub(crate) struct StructTypeField {
     pub normalized_type: NormalizedType,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Error)]
+pub enum UnsupportedObject {
+    #[error("Recursive object type reference detected for type '{0}' through path: {1}")]
+    Recursive(CustomTypeName, String),
+}
+
+type Struct = Result<StructType, UnsupportedObject>;
+
 fn struct_type(
-    default_schema: &Option<SubgraphName>,
+    default_schema: Option<&SubgraphName>,
     metadata: &resolved::Metadata,
-    custom_scalars: &HashMap<Qualified<CustomTypeName>, ndc_models::TypeRepresentation>,
+    custom_scalars: &BTreeMap<Qualified<CustomTypeName>, Scalar>,
     object_type_name: &Qualified<CustomTypeName>,
     object_type: &resolved::ObjectTypeWithRelationships,
-) -> StructType {
+    disallowed_object_types: &BTreeSet<Qualified<CustomTypeName>>,
+) -> Result<StructType, UnsupportedObject> {
     let object_type_fields = &object_type.object_type.fields;
     let mut struct_fields = IndexMap::new();
+    let mut unsupported_fields = IndexMap::new();
     let mut builder = datafusion::SchemaBuilder::new();
     for (field_name, field_definition) in object_type_fields {
         let field_type = to_arrow_type(
@@ -316,46 +353,74 @@ fn struct_type(
             metadata,
             custom_scalars,
             &field_definition.field_type.underlying_type,
+            disallowed_object_types,
         );
-        if let Some((normalized_type, field_type)) = field_type {
-            builder.push(datafusion::Field::new(
-                field_name.to_string(),
-                field_type.clone(),
-                field_definition.field_type.nullable,
-            ));
+        match field_type {
+            Err(UnsupportedType::Object(UnsupportedObject::Recursive(type_name, path))) => {
+                // We are in a nested context if and only if the disallowed_object_types
+                // stack/set has size > 1, because there are only two cases:
+                // 1. we added a new unseen type name to the set, which must have happened
+                //    when considering a nested object type, or
+                // 2. we re-added an already-seen type name, in which case the set size
+                //    would have remained unchanged. But this case would have been
+                //    short-circuited by the recursive type check anyway.
+                let is_nested = disallowed_object_types.len() > 1;
+                if is_nested {
+                    return Err(UnsupportedObject::Recursive(type_name, path));
+                }
+            }
+            Err(unsupported_type) => {
+                let unsupported_field = UnsupportedField {
+                    field_type: field_definition.field_type.clone(),
+                    reason: unsupported_type,
+                };
+                unsupported_fields.insert(field_name.clone(), unsupported_field);
+            }
+            Ok((normalized, flat)) => {
+                builder.push(datafusion::Field::new(
+                    field_name.to_string(),
+                    flat.clone(),
+                    field_definition.field_type.nullable,
+                ));
 
-            // let description = if let Some(ndc_models::TypeRepresentation::Enum { one_of }) =
-            //     type_representation
-            // {
-            //     // TODO: Instead of stuffing the possible enum values in description,
-            //     // surface them in the metadata tables.
-            //     Some(
-            //         field_definition
-            //             .description
-            //             .clone()
-            //             .unwrap_or_else(String::new)
-            //             + &format!(" Possible values: {}", one_of.join(", ")),
-            //     )
-            // } else {
-            //     field_definition.description.clone()
-            // };
-            let object_type_field = StructTypeField {
-                _name: field_name.clone(),
-                description: field_definition.description.clone(),
-                data_type: field_type,
-                is_nullable: field_definition.field_type.nullable,
-                normalized_type,
-            };
-            struct_fields.insert(field_name.clone(), object_type_field);
+                // let description = if let Some(ndc_models::TypeRepresentation::Enum { one_of }) =
+                //     type_representation
+                // {
+                //     // TODO: Instead of stuffing the possible enum values in description,
+                //     // surface them in the metadata tables.
+                //     Some(
+                //         field_definition
+                //             .description
+                //             .clone()
+                //             .unwrap_or_else(String::new)
+                //             + &format!(" Possible values: {}", one_of.join(", ")),
+                //     )
+                // } else {
+                //     field_definition.description.clone()
+                // };
+                let object_type_field = StructTypeField {
+                    _name: field_name.clone(),
+                    description: field_definition.description.clone(),
+                    data_type: flat,
+                    is_nullable: field_definition.field_type.nullable,
+                    normalized_type: normalized,
+                };
+                struct_fields.insert(field_name.clone(), object_type_field);
+            }
         }
     }
 
-    StructType {
+    let struct_type = StructType {
         name: StructTypeName::new(default_schema, object_type_name),
         description: object_type.object_type.description.clone(),
         fields: struct_fields,
+        unsupported_fields,
         schema: datafusion::SchemaRef::new(datafusion::Schema::new(builder.finish().fields)),
-    }
+    };
+
+    // struct_types.insert(object_type_name.clone(), struct_type.clone());
+
+    Ok(struct_type)
 }
 
 fn built_in_type(ty: &open_dds::types::InbuiltType) -> (NormalizedType, datafusion::DataType) {
@@ -371,6 +436,23 @@ fn built_in_type(ty: &open_dds::types::InbuiltType) -> (NormalizedType, datafusi
         NormalizedType::Named(NormalizedTypeNamed::Scalar(scalar.clone())),
         scalar,
     )
+}
+
+fn infer_ndc_representation(name: &CustomTypeName) -> Option<ndc_models::TypeRepresentation> {
+    match name.to_string().to_lowercase().as_str() {
+        "bool" => Some(ndc_models::TypeRepresentation::Boolean),
+        "int8" => Some(ndc_models::TypeRepresentation::Int8),
+        "int16" => Some(ndc_models::TypeRepresentation::Int16),
+        "int32" => Some(ndc_models::TypeRepresentation::Int32),
+        "int64" => Some(ndc_models::TypeRepresentation::Int64),
+        "float32" => Some(ndc_models::TypeRepresentation::Float32),
+        "float64" |
+        // BigDecimal128 is not supported by arrow.
+        "bigdecimal" => Some(ndc_models::TypeRepresentation::Float64),
+        "varchar" | "text" => Some(ndc_models::TypeRepresentation::String),
+        "timestamp" | "timestamptz" => Some(ndc_models::TypeRepresentation::Timestamp),
+        _ => None
+    }
 }
 
 fn ndc_representation_to_datatype(
@@ -407,56 +489,76 @@ fn ndc_representation_to_datatype(
 /// Converts an opendd type to an arrow type.
 #[allow(clippy::match_same_arms)]
 fn to_arrow_type(
-    default_schema: &Option<SubgraphName>,
+    default_schema: Option<&SubgraphName>,
     metadata: &resolved::Metadata,
-    custom_scalars: &HashMap<Qualified<CustomTypeName>, ndc_models::TypeRepresentation>,
+    custom_scalars: &BTreeMap<Qualified<CustomTypeName>, Scalar>,
     ty: &resolved::QualifiedBaseType,
-) -> Option<(NormalizedType, datafusion::DataType)> {
+    disallowed_object_types: &BTreeSet<Qualified<CustomTypeName>>,
+    // ) -> GeneratedArrowType {
+) -> Result<(NormalizedType, datafusion::DataType), UnsupportedType> {
     match &ty {
         resolved::QualifiedBaseType::Named(resolved::QualifiedTypeName::Inbuilt(inbuilt_type)) => {
-            Some(built_in_type(inbuilt_type))
+            Ok(built_in_type(inbuilt_type))
         }
         resolved::QualifiedBaseType::Named(resolved::QualifiedTypeName::Custom(custom_type)) => {
             // check if the custom type is a scalar
-            if let Some(ndc_representation) = custom_scalars.get(custom_type) {
-                ndc_representation_to_datatype(ndc_representation)
+            if let Some(scalar) = custom_scalars.get(custom_type) {
+                Ok(scalar.clone()?)
             } else if let Some(object_type) = metadata.object_types.get(custom_type) {
+                if disallowed_object_types.contains(custom_type) {
+                    let path = disallowed_object_types
+                        .iter()
+                        .map(|t| t.name.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" -> ");
+                    // If we have seen this type name before, then we have a recursive
+                    // object type. Recursive structs are not supported by datafusion,
+                    // so we cut off the recursion here and omit this field.
+                    return Err(UnsupportedType::Object(UnsupportedObject::Recursive(
+                        custom_type.name.clone(),
+                        path,
+                    )));
+                }
+
+                let mut disallowed_object_types = disallowed_object_types.clone();
+                disallowed_object_types.insert(custom_type.clone());
+
                 let struct_type = struct_type(
                     default_schema,
                     metadata,
                     custom_scalars,
                     custom_type,
                     object_type,
-                );
-                let datafusion_type =
-                    datafusion::DataType::Struct(struct_type.table_schema().fields.clone());
-                Some((
+                    &disallowed_object_types,
+                )?;
+
+                let flat = datafusion::DataType::Struct(struct_type.table_schema().fields.clone());
+                Ok((
                     NormalizedType::Named(NormalizedTypeNamed::Struct(struct_type.name().clone())),
-                    datafusion_type,
+                    flat,
                 ))
             } else {
-                None
+                Err(UnsupportedType::InternalNotFound)
             }
         }
         resolved::QualifiedBaseType::List(element_type) => {
-            let (normalized_type, data_type) = to_arrow_type(
+            let (normalized, flat) = to_arrow_type(
                 default_schema,
                 metadata,
                 custom_scalars,
                 &element_type.underlying_type,
+                disallowed_object_types,
             )?;
-            let datafusion_type = datafusion::DataType::List(Arc::new(datafusion::Field::new(
+            let flat = datafusion::DataType::List(Arc::new(datafusion::Field::new(
                 "element",
-                data_type,
+                flat,
                 element_type.nullable,
             )));
-            Some((
-                NormalizedType::List(Box::new(NormalizedTypeReference {
-                    underlying_type: normalized_type,
-                    nullable: element_type.nullable,
-                })),
-                datafusion_type,
-            ))
+            let normalized = NormalizedType::List(Box::new(NormalizedTypeReference {
+                underlying_type: normalized,
+                nullable: element_type.nullable,
+            }));
+            Ok((normalized, flat))
         }
     }
 }
