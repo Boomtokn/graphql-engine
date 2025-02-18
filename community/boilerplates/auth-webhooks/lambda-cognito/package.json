@@ -10,6 +10,6 @@
   "license": "ISC",
   "dependencies": {
     "graphql-request": "*",
-    "node-jose": "^1.1.0"
+    "node-jose": "^2.2.0"
   }
 }
