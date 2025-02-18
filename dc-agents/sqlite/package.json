@@ -21,7 +21,7 @@
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
-    "@fastify/cors": "^8.1.0",
+    "@fastify/cors": "^8.5.0",
     "@hasura/dc-api-types": "0.45.0",
     "fastify-metrics": "^9.2.1",
     "fastify": "^5.2.1",
