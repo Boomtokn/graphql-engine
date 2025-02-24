@@ -168,7 +168,7 @@
     "sanitize-filename": "1.6.3",
     "semver": "5.7.2",
     "sql-formatter": "2.3.3",
-    "styled-components": "5.0.1",
+    "styled-components": "6.1.0",
     "styled-system": "5.1.5",
     "subscriptions-transport-ws": "0.9.16",
     "swagger2openapi": "^7.0.8",
