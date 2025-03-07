@@ -13342,14 +13342,14 @@ __metadata:
   languageName: node
   linkType: hard
 
-"axios@npm:1.7.5":
-  version: 1.7.5
-  resolution: "axios@npm:1.7.5"
+"axios@npm:1.8.2":
+  version: 1.8.2
+  resolution: "axios@npm:1.8.2"
   dependencies:
     follow-redirects: ^1.15.6
     form-data: ^4.0.0
     proxy-from-env: ^1.1.0
-  checksum: 2859fe01437cf133eee35571abc1d4b5224bb13e530e66cb3581ca226e170541dd5eef9f46abb41592cee0a2f54930c9e4978354e0cf1064748fc20d9a05e9d5
+  checksum: c47a43b79a058aa9e53a65bec9ade35c9f6e76a3999c795a79a2d205fb5f803fd4245497a0209a9727cbbe4f558791dd852ad2c168c5fc030259c11598ed8fd7
   languageName: node
   linkType: hard
 
@@ -19820,7 +19820,7 @@ __metadata:
     apollo-link-ws: 1.0.20
     autoprefixer: 10.4.13
     await-to-js: ^3.0.0
-    axios: 1.7.5
+    axios: 1.8.2
     babel-jest: 29.4.3
     babel-loader: 8.1.0
     babel-plugin-istanbul: 5.2.0
